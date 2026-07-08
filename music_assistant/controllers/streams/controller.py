@@ -961,7 +961,10 @@ class StreamsController(CoreController):
         # for the duration of the flow stream (see audio_analysis.playback_active).
         self._active_output_streams += 1
         flow_stream = self.audio.get_queue_flow_stream(
-            queue=queue, start_queue_item=start_queue_item, pcm_format=flow_pcm_format
+            queue=queue,
+            start_queue_item=start_queue_item,
+            pcm_format=flow_pcm_format,
+            flow_player=player,
         )
         if overlay_active(queue):
             flow_stream = self.audio.get_overlay_mixed_stream(queue, flow_stream, flow_pcm_format)
@@ -1214,7 +1217,10 @@ class StreamsController(CoreController):
                 )
                 assert start_queue_item
                 flow_stream = self.audio.get_queue_flow_stream(
-                    queue=queue, start_queue_item=start_queue_item, pcm_format=pcm_format
+                    queue=queue,
+                    start_queue_item=start_queue_item,
+                    pcm_format=pcm_format,
+                    flow_player=protocol_player,
                 )
                 if overlay_active(queue):
                     flow_stream = self.audio.get_overlay_mixed_stream(
