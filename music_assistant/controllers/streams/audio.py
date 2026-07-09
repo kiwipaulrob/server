@@ -2034,7 +2034,7 @@ class StreamsAudio:
         queue: PlayerQueue,
         start_queue_item: QueueItem,
         pcm_format: AudioFormat,
-        flow_player: Player | None = None,
+        protocol_player: Player | None = None,
     ) -> AsyncGenerator[bytes]:
         """
         Get a flow stream of all tracks in the queue as raw PCM audio.
@@ -2044,7 +2044,7 @@ class StreamsAudio:
         :param queue: The PlayerQueue to stream.
         :param start_queue_item: The queue item to start the flow stream with.
         :param pcm_format: The PCM format for the flow stream.
-        :param flow_player: The (protocol) player actually consuming the flow stream.
+        :param protocol_player: The protocol player actually consuming the flow stream.
             Must be the same player that was used to select ``pcm_format`` so
             restart decisions are made against the correct supported sample rates
             and flow mode configuration. Falls back to the queue's player when omitted.
@@ -2081,7 +2081,7 @@ class StreamsAudio:
                 CONF_PLAYER_QUEUES, CONF_CROSSFADE_DURATION, 8
             )
         flow_mode_sample_rate_conf, flow_supported_sample_rates = self._flow_restart_context(
-            queue.queue_id, flow_player
+            queue.queue_id, protocol_player
         )
         # note: get_crossfade_mode() already falls back to standard when smart fades aren't
         # available (no analysis provider / minimal buffer), so crossfade_mode is safe to use.
@@ -3036,7 +3036,7 @@ class StreamsAudio:
         )
 
     def _flow_restart_context(
-        self, queue_id: str, flow_player: Player | None
+        self, queue_id: str, protocol_player: Player | None
     ) -> tuple[str, list[int]]:
         """
         Resolve the flow mode config and supported sample rates for restart decisions.
@@ -3045,22 +3045,26 @@ class StreamsAudio:
         player the flow's PCM format was anchored on — over the queue's (wrapper)
         player, whose config may lack the audio/protocol specific entries.
 
-        :param queue_id: The queue ID, used as fallback when no flow player is given.
-        :param flow_player: The (protocol) player consuming the flow stream, if known.
+        :param queue_id: The queue ID, used as fallback when no protocol player is given.
+        :param protocol_player: The protocol player consuming the flow stream, if known.
         :return: Tuple of (flow mode sample rate config value, sorted supported rates).
         """
-        if flow_player is None:
-            flow_player = self.mass.players.get_player(queue_id)
-        if flow_player is None:
+        if protocol_player is None:
+            protocol_player = self.mass.players.get_player(queue_id)
+        if protocol_player is None:
             flow_mode_sample_rate_conf = self.mass.config.get_raw_player_config_value(
                 queue_id, CONF_FLOW_MODE_SAMPLE_RATE, FLOW_MODE_SAMPLE_RATE_SMART
             )
             return flow_mode_sample_rate_conf, []
         flow_mode_sample_rate_conf = cast(
             "str",
-            flow_player.config.get_value(CONF_FLOW_MODE_SAMPLE_RATE, FLOW_MODE_SAMPLE_RATE_SMART),
+            protocol_player.config.get_value(
+                CONF_FLOW_MODE_SAMPLE_RATE, FLOW_MODE_SAMPLE_RATE_SMART
+            ),
         )
-        supported_sample_rates = sorted({sr for sr, _ in flow_player.get_supported_sample_rates()})
+        supported_sample_rates = sorted(
+            {sr for sr, _ in protocol_player.get_supported_sample_rates()}
+        )
         return flow_mode_sample_rate_conf, supported_sample_rates
 
     def _flow_stream_needs_restart(
