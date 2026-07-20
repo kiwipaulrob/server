@@ -2,13 +2,17 @@
 
 import logging
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from music_assistant_models.enums import ContentType
 from music_assistant_models.media_items import AudioFormat
 
-from music_assistant.providers.airplay.constants import StreamingProtocol
+from music_assistant.providers.airplay.constants import (
+    AIRPLAY_ARTWORK_MAX_BYTES,
+    AIRPLAY_ARTWORK_SIZE,
+    StreamingProtocol,
+)
 from music_assistant.providers.airplay.stream import AirPlayStream
 
 START_UNIX_MS = 1_750_000_000_000
@@ -223,3 +227,54 @@ async def test_wait_for_connection_pushes_metadata_immediately() -> None:
     # The volume resend is still deferred (existing behavior preserved).
     assert player.provider.mass.call_later.call_count == 1
     assert player.provider.mass.call_later.call_args_list[0].args[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_prepare_artwork_returns_bounded_cache_path() -> None:
+    """Artwork preparation returns the shared cache path without a per-player copy."""
+    player = _make_player()
+    stream = AirPlayStream(player)
+    image_url = "https://example.com/artwork.png"
+    cached_path = "/cache/thumbnails/artwork_flat_b65536.jpg"
+
+    with patch(
+        "music_assistant.providers.airplay.stream.get_image_thumb_path",
+        new=AsyncMock(return_value=cached_path),
+    ) as get_thumb_path:
+        result = await stream._prepare_artwork(image_url)
+
+    assert result == cached_path
+    assert not hasattr(stream, "_artwork_path")
+    get_thumb_path.assert_awaited_once_with(
+        stream.mass,
+        image_url,
+        AIRPLAY_ARTWORK_SIZE,
+        "",
+        image_format="JPEG",
+        flatten_transparency=True,
+        max_bytes=AIRPLAY_ARTWORK_MAX_BYTES,
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_metadata_passes_cached_artwork_path_to_binary() -> None:
+    """The ARTWORK command passes the absolute cache path returned by preparation."""
+    player = _make_player()
+    stream = AirPlayStream(player)
+    metadata = MagicMock(
+        duration=180,
+        title="Track",
+        artist="Artist",
+        album="Album",
+        image_url="https://example.com/artwork.png",
+    )
+    cached_path = "/cache/thumbnails/artwork_flat_b65536.jpg"
+    send_command = AsyncMock()
+
+    with (
+        patch.object(stream, "_prepare_artwork", new=AsyncMock(return_value=cached_path)),
+        patch.object(stream, "send_cli_command", new=send_command),
+    ):
+        await stream.send_metadata(None, metadata)
+
+    assert send_command.await_args_list[-1] == call(f"ARTWORK={cached_path}")

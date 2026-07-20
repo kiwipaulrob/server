@@ -14,14 +14,14 @@ import logging
 import time
 from typing import TYPE_CHECKING, cast
 
-import aiofiles
 from music_assistant_models.enums import PlaybackState
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
-from music_assistant.helpers.images import get_image_thumb
+from music_assistant.helpers.images import get_image_thumb_path
 from music_assistant.helpers.named_pipe import AsyncNamedPipeWriter
 from music_assistant.helpers.process import AsyncProcess
 from music_assistant.providers.airplay.constants import (
+    AIRPLAY_ARTWORK_MAX_BYTES,
     AIRPLAY_ARTWORK_SIZE,
     AIRPLAY_PCM_FORMAT,
     CONF_AIRPLAY_CREDENTIALS,
@@ -84,8 +84,6 @@ class AirPlayStream:
         # Route the binary resolved for this stream (empty until reported),
         # e.g. "AirPlay 2 (native, PTP)" or "RAOP"
         self.active_route: str = ""
-        # Local file the rendered cover art is written to for the binary to embed
-        self._artwork_path = f"/tmp/cliairplay-art-{self.player.player_id}.jpg"  # noqa: S108
 
     @property
     def running(self) -> bool:
@@ -489,26 +487,24 @@ class AirPlayStream:
 
     async def _prepare_artwork(self, image_url: str) -> str | None:
         """
-        Render cover art to a local JPEG file the binary can embed.
+        Return a compatible cached JPEG path for the binary to embed.
 
         The binary consumes artwork as a local file only; it does not fetch
-        URLs. The image is flattened to JPEG (legacy AirPlay receivers cannot
-        be assumed to handle transparency) and written to a per-player path.
+        URLs. The image is flattened to a size-bounded JPEG that is compatible
+        with both legacy AirPlay receivers and Apple TV MediaRemote.
 
         :param image_url: The (imageproxy or remote) cover-art URL.
         """
         try:
-            jpeg = await get_image_thumb(
+            return await get_image_thumb_path(
                 self.mass,
                 image_url,
                 AIRPLAY_ARTWORK_SIZE,
                 "",
                 image_format="JPEG",
                 flatten_transparency=True,
+                max_bytes=AIRPLAY_ARTWORK_MAX_BYTES,
             )
-            async with aiofiles.open(self._artwork_path, "wb") as artfile:
-                await artfile.write(jpeg)
         except Exception as err:
             self.player.logger.debug("Could not prepare artwork: %s", err)
             return None
-        return self._artwork_path
