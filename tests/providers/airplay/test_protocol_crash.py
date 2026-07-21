@@ -11,7 +11,7 @@ transferring leadership to a healthy member.
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -88,3 +88,18 @@ async def test_crash_on_member_idles_and_ungroups() -> None:
     state_arg: Any = kwargs.get("state")
     assert state_arg is not None
     assert state_arg.value == "idle"
+
+
+@pytest.mark.asyncio
+async def test_abort_runs_crash_cleanup_after_force_kill() -> None:
+    """Force-aborting a stalled process still ungroups and idles the player."""
+    stream, player, mass = _make_stream(group_members=[])
+    cli_proc: Any = stream._cli_proc
+    cli_proc.closed = False
+    cli_proc.kill = AsyncMock()
+
+    await stream.abort()
+
+    cli_proc.kill.assert_awaited_once_with()
+    mass.players.cmd_ungroup.assert_called_once_with(player.player_id)
+    player.set_state_from_stream.assert_called_once()

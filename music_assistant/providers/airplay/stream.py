@@ -12,6 +12,7 @@ import asyncio
 import ipaddress
 import logging
 import time
+from contextlib import suppress
 from typing import TYPE_CHECKING, cast
 
 import aiofiles
@@ -24,6 +25,8 @@ from music_assistant.helpers.process import AsyncProcess
 from music_assistant.providers.airplay.constants import (
     AIRPLAY_ARTWORK_SIZE,
     AIRPLAY_PCM_FORMAT,
+    AIRPLAY_STATUS_STALL_TIMEOUT,
+    AIRPLAY_STATUS_WATCHDOG_INTERVAL,
     CONF_AIRPLAY_CREDENTIALS,
     CONF_PASSWORD,
     CONF_RAOP_CREDENTIALS,
@@ -77,6 +80,11 @@ class AirPlayStream:
         self._last_progress_sent: int = -1
         self._elapsed_time_offset: float | None = None
         self._stdout_reader_task: asyncio.Task[None] | None = None
+        self._status_watchdog_task: asyncio.Task[None] | None = None
+        self._last_elapsed_ms: int | None = None
+        self._last_elapsed_advanced_at: float | None = None
+        self._confirmed_queue_position: tuple[str, str, float] | None = None
+        self._native_realtime = False
         # Device latency info reported by the binary after connect (0 = unreported)
         self.latency_lead_ms: int = 0
         self.device_min_frames: int = 0
@@ -97,6 +105,11 @@ class AirPlayStream:
         """Return boolean if the device connection has been established."""
         return self._connected.is_set()
 
+    @property
+    def confirmed_queue_position(self) -> tuple[str, str, float] | None:
+        """Return the queue item and media position confirmed by the latest status."""
+        return self._confirmed_queue_position
+
     async def start(self, start_unix_ms: int, use_shared_ptp: bool | None = None) -> None:
         """
         Start cliairplay process.
@@ -116,6 +129,7 @@ class AirPlayStream:
         await self._cli_proc.start()
         self._cli_proc.attach_stderr_reader(self.mass.create_task(self._stderr_reader()))
         self._stdout_reader_task = self.mass.create_task(self._stdout_reader())
+        self._status_watchdog_task = self.mass.create_task(self._status_watchdog())
 
     async def wait_for_connection(self) -> None:
         """Wait for device connection to be established."""
@@ -146,6 +160,7 @@ class AirPlayStream:
         """
         await self.send_cli_command("ACTION=STOP")
         self._stopped = True
+        await self._cancel_status_watchdog()
         await self.commands_pipe.remove()
         # stop the stdout reader first so process close can drain the pipe
         if self._stdout_reader_task and not self._stdout_reader_task.done():
@@ -159,6 +174,16 @@ class AirPlayStream:
             if self._cli_proc and not self._cli_proc.closed:
                 await self._cli_proc.close()
         self.player.set_state_from_stream(state=PlaybackState.IDLE, elapsed_time=0)
+
+    async def abort(self) -> None:
+        """Terminate a failed transport and run the normal unexpected-stop handling."""
+        if self._stopped:
+            return
+        self._stopped = True
+        await self._cancel_status_watchdog()
+        if self._cli_proc and not self._cli_proc.closed:
+            await self._cli_proc.kill()
+        self._handle_unexpected_stop()
 
     async def write_audio(self, data: bytes) -> None:
         """
@@ -388,6 +413,11 @@ class AirPlayStream:
         """Parse the [STATUS] route line and log which route this stream took."""
         fields = dict(part.split("=", 1) for part in line.split() if "=" in part)
         protocol = fields.get("protocol", "")
+        self._native_realtime = (
+            protocol == "airplay2"
+            and fields.get("flow") == "native"
+            and fields.get("buffered") != "1"
+        )
         if protocol == "airplay2":
             flow = fields.get("flow", "")
             timing = fields.get("timing", "")
@@ -444,7 +474,7 @@ class AirPlayStream:
                 except ValueError, IndexError:
                     pass
                 else:
-                    self._update_elapsed(millis / 1000)
+                    self._update_elapsed(millis)
             elif "[STATUS] paused" in line:
                 player.set_state_from_stream(state=PlaybackState.PAUSED, stream=self)
             elif "[STATUS] eof" in line:
@@ -461,22 +491,17 @@ class AirPlayStream:
         if not self._stopped:
             self._stopped = True
             if not expected_eof:
-                logger.warning(
-                    "cliairplay process stopped unexpectedly for %s", player.display_name
-                )
-                # Hand off to the player controller so it drops just this member, or
-                # transfers leadership to a healthy member, instead of dissolving the
-                # whole group over a single dead transport. A sync leader is left in
-                # its current state here on purpose: the controller only transfers
-                # leadership while the queue still looks active, and transfer_queue or
-                # dissolve sets the final state.
-                self.mass.create_task(self.mass.players.cmd_ungroup(player.player_id))
-                if player.group_members:
-                    return
+                self._handle_unexpected_stop()
+                return
             player.set_state_from_stream(state=PlaybackState.IDLE, elapsed_time=0, stream=self)
 
-    def _update_elapsed(self, elapsed_time: float) -> None:
+    def _update_elapsed(self, elapsed_ms: int) -> None:
         """Update elapsed time with session offset compensation."""
+        elapsed_advanced = self._last_elapsed_ms is None or elapsed_ms > self._last_elapsed_ms
+        if elapsed_advanced:
+            self._last_elapsed_ms = elapsed_ms
+            self._last_elapsed_advanced_at = time.monotonic()
+        elapsed_time = elapsed_ms / 1000
         if self._elapsed_time_offset is None and self.session:
             self._elapsed_time_offset = max(0, time.time() - self.session.start_time - elapsed_time)
         if self._elapsed_time_offset:
@@ -486,6 +511,74 @@ class AirPlayStream:
         self.player.set_state_from_stream(
             state=PlaybackState.PLAYING, elapsed_time=elapsed_time, stream=self
         )
+        if elapsed_advanced:
+            self._capture_confirmed_queue_position()
+
+    async def _status_watchdog(self) -> None:
+        """Recover a native AirPlay 2 stream whose rendered position stops advancing."""
+        while self.running:
+            await asyncio.sleep(AIRPLAY_STATUS_WATCHDOG_INTERVAL)
+            if not self._playback_status_stalled():
+                continue
+            if self.session and not self.session.recover_stalled_stream(self.player, self):
+                continue
+            self.player.logger.warning(
+                "Native AirPlay 2 playback stalled for %s; recovering the transport",
+                self.player.display_name,
+            )
+            if not self.session:
+                await self.abort()
+            return
+
+    def _playback_status_stalled(self) -> bool:
+        """Return whether native AirPlay 2 elapsed status has stopped advancing."""
+        return (
+            self._native_realtime
+            and self._last_elapsed_advanced_at is not None
+            and self.player.playback_state == PlaybackState.PLAYING
+            and (time.monotonic() - self._last_elapsed_advanced_at) >= AIRPLAY_STATUS_STALL_TIMEOUT
+        )
+
+    async def _cancel_status_watchdog(self) -> None:
+        """Cancel and await the status watchdog unless it is the current task."""
+        if (
+            self._status_watchdog_task
+            and self._status_watchdog_task is not asyncio.current_task()
+            and not self._status_watchdog_task.done()
+        ):
+            self._status_watchdog_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._status_watchdog_task
+
+    def _capture_confirmed_queue_position(self) -> None:
+        """Remember the media position corresponding to an advancing binary status."""
+        queue = self.mass.player_queues.get_active_queue(self.player.player_id)
+        if queue is None or queue.current_item is None:
+            return
+        self._confirmed_queue_position = (
+            queue.queue_id,
+            queue.current_item.queue_item_id,
+            max(0, queue.corrected_elapsed_time),
+        )
+
+    def _handle_unexpected_stop(self) -> None:
+        """Clean up ownership and state after cliairplay stops unexpectedly."""
+        player = self.player
+        player.logger.warning("cliairplay process stopped unexpectedly for %s", player.display_name)
+        if self.session is None:
+            provider = cast("AirPlayProvider", self.prov)
+            if provider.bridge_manager.stop_streaming(player.player_id) is True:
+                return
+        # Hand off to the player controller so it drops just this member, or
+        # transfers leadership to a healthy member, instead of dissolving the
+        # whole group over a single dead transport. A sync leader is left in
+        # its current state here on purpose: the controller only transfers
+        # leadership while the queue still looks active, and transfer_queue or
+        # dissolve sets the final state.
+        self.mass.create_task(self.mass.players.cmd_ungroup(player.player_id))
+        if player.group_members:
+            return
+        player.set_state_from_stream(state=PlaybackState.IDLE, elapsed_time=0, stream=self)
 
     async def _prepare_artwork(self, image_url: str) -> str | None:
         """

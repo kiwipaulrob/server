@@ -390,6 +390,7 @@ The provider monitors stderr in a separate task (`_stderr_reader()` in [stream.p
 - Detect connection completion
 - Handle errors and packet loss
 - Track elapsed time
+- Restart a stalled native AirPlay 2 stream from its last confirmed queue position
 
 ## Start Timing and Synchronization
 

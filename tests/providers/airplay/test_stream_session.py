@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from music_assistant_models.enums import MediaType
 
 from music_assistant.providers.airplay.stream_session import AirPlayStreamSession
 
@@ -242,3 +243,68 @@ async def test_cleanup_after_removal_skips_idle_when_player_has_new_session_stre
         await session._cleanup_after_removal(player)
 
     player.set_state_from_stream.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("media_type", "elapsed_time", "expected_seek"),
+    [
+        (MediaType.TRACK, 42.9, 42),
+        (MediaType.RADIO, 42.9, 0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stall_recovery_restarts_at_last_confirmed_position(
+    media_type: MediaType, elapsed_time: float, expected_seek: int
+) -> None:
+    """A first native stall restarts the active item at its confirmed position."""
+    session = _make_session(time.time() - 10, 12.5)
+    player: Any = session.sync_clients[0]
+    player.player_id = "stalled_player"
+    player.display_name = "Stalled Player"
+    player.last_stall_recovery = None
+    stalled_stream: Any = player.stream
+    stalled_stream.session = session
+    stalled_stream.confirmed_queue_position = ("active_queue", "queue_item", elapsed_time)
+    mass: Any = session.mass
+
+    queue_item = MagicMock()
+    queue_item.media_type = media_type
+    mass.player_queues.get_item.return_value = queue_item
+    mass.player_queues.play_index = AsyncMock()
+
+    with patch(
+        "music_assistant.providers.airplay.stream_session.time.monotonic",
+        return_value=1000,
+    ):
+        await session._recover_stalled_stream(player, stalled_stream)
+
+    assert player.last_stall_recovery == 1000
+    mass.player_queues.play_index.assert_awaited_once_with(
+        "active_queue",
+        "queue_item",
+        seek_position=expected_seek,
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_stall_terminates_transport() -> None:
+    """A repeated stall inside the cooldown is terminated instead of restart-looping."""
+    session = _make_session(time.time() - 10, 12.5)
+    player: Any = session.sync_clients[0]
+    player.player_id = "stalled_player"
+    player.display_name = "Stalled Player"
+    player.last_stall_recovery = 900.0
+    stalled_stream: Any = player.stream
+    stalled_stream.session = session
+    stalled_stream.abort = AsyncMock()
+    mass: Any = session.mass
+    mass.player_queues.play_index = AsyncMock()
+
+    with patch(
+        "music_assistant.providers.airplay.stream_session.time.monotonic",
+        return_value=1000,
+    ):
+        await session._recover_stalled_stream(player, stalled_stream)
+
+    stalled_stream.abort.assert_awaited_once_with()
+    mass.player_queues.play_index.assert_not_awaited()

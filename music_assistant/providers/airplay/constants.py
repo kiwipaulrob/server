@@ -49,6 +49,12 @@ AIRPLAY_AP2_SETUP_LEAD_MS: Final[int] = 2500
 # Late joiners keep a more conservative headroom: besides connecting, their
 # pipeline must also be primed from the session's history buffer.
 AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS: Final[int] = 2000
+# Native AirPlay 2 reports its rendered position every second. Missing several
+# consecutive updates means the realtime sender or control session is no longer
+# making progress even when the cliairplay process itself is still alive.
+AIRPLAY_STATUS_WATCHDOG_INTERVAL: Final[int] = 5
+AIRPLAY_STATUS_STALL_TIMEOUT: Final[int] = 15
+AIRPLAY_STALL_RECOVERY_COOLDOWN: Final[int] = 300
 
 # Cover art is rendered to a local JPEG for the binary to embed (the binary
 # does not fetch URLs). 512px keeps the SET_PARAMETER payload small while still

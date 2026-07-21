@@ -8,14 +8,18 @@ from collections.abc import AsyncGenerator
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
-from music_assistant_models.enums import PlaybackState
+from music_assistant_models.enums import MediaType, PlaybackState
 from music_assistant_models.errors import PlayerCommandFailed
 
 from music_assistant.constants import CONF_SYNC_ADJUST
 from music_assistant.controllers.streams.audio_processing import get_media_session_id
 from music_assistant.helpers.ffmpeg import FFMpeg
 
-from .constants import AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS, StreamingProtocol
+from .constants import (
+    AIRPLAY_LATE_JOIN_MIN_HEADROOM_MS,
+    AIRPLAY_STALL_RECOVERY_COOLDOWN,
+    StreamingProtocol,
+)
 from .helpers import get_final_output_format
 from .stream import AirPlayStream
 
@@ -53,6 +57,7 @@ class AirPlayStreamSession:
         self.media = media
         self.sync_clients = sync_clients
         self._audio_source_task: asyncio.Task[None] | None = None
+        self._stall_recovery_task: asyncio.Task[None] | None = None
         self._player_ffmpeg: dict[str, FFMpeg] = {}
         self._lock = asyncio.Lock()
         self.start_unix_ms: int = 0
@@ -104,6 +109,14 @@ class AirPlayStreamSession:
 
     async def stop(self) -> None:
         """Stop playback and cleanup."""
+        if (
+            self._stall_recovery_task
+            and self._stall_recovery_task is not asyncio.current_task()
+            and not self._stall_recovery_task.done()
+        ):
+            self._stall_recovery_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._stall_recovery_task
         if self._audio_source_task and not self._audio_source_task.done():
             self._audio_source_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -283,6 +296,24 @@ class AirPlayStreamSession:
                     time.time() - now,
                 )
                 await self.remove_client(airplay_player, reason="late joiner connection timeout")
+
+    def recover_stalled_stream(
+        self, airplay_player: AirPlayPlayer, stalled_stream: AirPlayStream
+    ) -> bool:
+        """
+        Restart playback after a native AirPlay 2 stream stops making progress.
+
+        :param airplay_player: The player whose native stream stalled.
+        :param stalled_stream: The stream that detected the stall.
+        :return: True if this stream owns the session recovery task.
+        """
+        if self._stall_recovery_task and not self._stall_recovery_task.done():
+            return False
+        self._stall_recovery_task = self.mass.create_task(
+            self._recover_stalled_stream(airplay_player, stalled_stream),
+            task_id=f"airplay_stall_recovery_{id(self)}",
+        )
+        return True
 
     async def _resolve_shared_ptp(self) -> bool:
         """
@@ -497,3 +528,75 @@ class AirPlayStreamSession:
         )
         await ffmpeg.start()
         self._player_ffmpeg[airplay_player.player_id] = ffmpeg
+
+    async def _recover_stalled_stream(
+        self, airplay_player: AirPlayPlayer, stalled_stream: AirPlayStream
+    ) -> None:
+        """Restart the active queue or terminate a repeatedly stalled transport."""
+        if airplay_player.stream is not stalled_stream or stalled_stream.session is not self:
+            return
+
+        now = time.monotonic()
+        if (
+            airplay_player.last_stall_recovery is not None
+            and now - airplay_player.last_stall_recovery < AIRPLAY_STALL_RECOVERY_COOLDOWN
+        ):
+            self.prov.logger.error(
+                "Native AirPlay 2 playback for %s stalled again within %d seconds; "
+                "stopping the failed transport",
+                airplay_player.display_name,
+                AIRPLAY_STALL_RECOVERY_COOLDOWN,
+            )
+            await self._abort_stalled_stream(airplay_player, stalled_stream)
+            return
+
+        confirmed_position = stalled_stream.confirmed_queue_position
+        if confirmed_position is None:
+            self.prov.logger.error(
+                "Unable to recover stalled AirPlay playback for %s: no confirmed queue position",
+                airplay_player.display_name,
+            )
+            await self._abort_stalled_stream(airplay_player, stalled_stream)
+            return
+
+        queue_id, queue_item_id, elapsed_time = confirmed_position
+        queue_item = self.mass.player_queues.get_item(queue_id, queue_item_id)
+        if queue_item is None:
+            self.prov.logger.error(
+                "Unable to recover stalled AirPlay playback for %s: queue item is unavailable",
+                airplay_player.display_name,
+            )
+            await self._abort_stalled_stream(airplay_player, stalled_stream)
+            return
+
+        for sync_client in self.sync_clients:
+            sync_client.last_stall_recovery = now
+        seek_position = 0 if queue_item.media_type == MediaType.RADIO else max(0, int(elapsed_time))
+        self.prov.logger.info(
+            "Restarting AirPlay queue %s at %d seconds after native playback stalled",
+            queue_id,
+            seek_position,
+        )
+        try:
+            await self.mass.player_queues.play_index(
+                queue_id,
+                queue_item_id,
+                seek_position=seek_position,
+            )
+        except Exception as err:
+            self.prov.logger.error(
+                "Unable to restart stalled AirPlay playback for %s: %s",
+                airplay_player.display_name,
+                err,
+                exc_info=err,
+            )
+            await self._abort_stalled_stream(airplay_player, stalled_stream)
+
+    @staticmethod
+    async def _abort_stalled_stream(
+        airplay_player: AirPlayPlayer, stalled_stream: AirPlayStream
+    ) -> None:
+        """Terminate a stalled process so normal crash handling updates the player state."""
+        if airplay_player.stream is not stalled_stream:
+            return
+        await stalled_stream.abort()

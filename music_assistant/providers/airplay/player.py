@@ -94,6 +94,7 @@ class AirPlayPlayer(Player):
         self.address = address
         self.stream: AirPlayStream | None = None
         self.last_command_sent = 0.0
+        self.last_stall_recovery: float | None = None
         self._lock = asyncio.Lock()
         self._active_pairing: AirPlayPairing | None = None
         self._transitioning = False  # Set during stream replacement to ignore stale DACP messages

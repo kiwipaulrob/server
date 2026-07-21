@@ -2,10 +2,10 @@
 
 import logging
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from music_assistant_models.enums import ContentType
+from music_assistant_models.enums import ContentType, PlaybackState
 from music_assistant_models.media_items import AudioFormat
 
 from music_assistant.providers.airplay.constants import StreamingProtocol
@@ -50,6 +50,7 @@ def _make_player() -> MagicMock:
     prov.ptp_daemon_running = True
     prov.logger = logging.getLogger("test.airplay.prov")
     prov.mass.streams.publish_ip = "192.168.1.99"
+    prov.mass.player_queues.get_active_queue.return_value = None
     player.provider = prov
     return player
 
@@ -191,6 +192,78 @@ def test_parse_latency_status() -> None:
     assert stream.latency_lead_ms == 1750
     assert stream.device_min_frames == 11025
     assert stream.device_max_frames == 88200
+
+
+def test_native_realtime_stall_detection() -> None:
+    """Only a non-advancing native realtime stream is considered stalled."""
+    player = _make_player()
+    player.playback_state = PlaybackState.PLAYING
+    stream = AirPlayStream(player)
+    stream._parse_route_status("[STATUS] route protocol=airplay2 flow=native timing=ptp buffered=0")
+
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=100):
+        stream._update_elapsed(1000)
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=114):
+        stream._update_elapsed(1000)
+        assert not stream._playback_status_stalled()
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=115):
+        assert stream._playback_status_stalled()
+
+    queue = MagicMock()
+    queue.queue_id = "active_queue"
+    queue.current_item.queue_item_id = "queue_item"
+    queue.corrected_elapsed_time = 12.5
+    player.provider.mass.player_queues.get_active_queue.return_value = queue
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=115):
+        stream._update_elapsed(2000)
+    assert stream.confirmed_queue_position == ("active_queue", "queue_item", 12.5)
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=129):
+        assert not stream._playback_status_stalled()
+
+    stream._parse_route_status("[STATUS] route protocol=airplay2 flow=native timing=ptp buffered=1")
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=200):
+        assert not stream._playback_status_stalled()
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_watchdog_requests_session_recovery() -> None:
+    """A native realtime status stall requests one session-level recovery."""
+    player = _make_player()
+    player.playback_state = PlaybackState.PLAYING
+    stream = AirPlayStream(player)
+    stream._cli_proc = MagicMock(closed=False)
+    stream.session = MagicMock()
+    stream._native_realtime = True
+    stream._last_elapsed_advanced_at = 100
+    stream.session.recover_stalled_stream.side_effect = [False, True]
+
+    with (
+        patch(
+            "music_assistant.providers.airplay.stream.asyncio.sleep",
+            new_callable=AsyncMock,
+        ),
+        patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=115),
+    ):
+        await stream._status_watchdog()
+
+    assert stream.session.recover_stalled_stream.call_count == 2
+    stream.session.recover_stalled_stream.assert_called_with(player, stream)
+
+
+@pytest.mark.asyncio
+async def test_sessionless_stall_stops_sendspin_bridge() -> None:
+    """A stalled sessionless stream tears down its owning Sendspin bridge."""
+    player = _make_player()
+    player.provider.bridge_manager.stop_streaming.return_value = True
+    stream = AirPlayStream(player)
+    stream._cli_proc = MagicMock(closed=False)
+    stream._cli_proc.kill = AsyncMock()
+
+    await stream.abort()
+
+    stream._cli_proc.kill.assert_awaited_once_with()
+    player.provider.bridge_manager.stop_streaming.assert_called_once_with(player.player_id)
+    player.set_state_from_stream.assert_not_called()
 
 
 @pytest.mark.asyncio
