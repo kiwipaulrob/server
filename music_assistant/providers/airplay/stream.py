@@ -181,6 +181,9 @@ class AirPlayStream:
             return
         self._stopped = True
         await self._cancel_status_watchdog()
+        await self.commands_pipe.remove()
+        if self._stdout_reader_task and not self._stdout_reader_task.done():
+            self._stdout_reader_task.cancel()
         if self._cli_proc and not self._cli_proc.closed:
             await self._cli_proc.kill()
         self._handle_unexpected_stop()
@@ -497,8 +500,8 @@ class AirPlayStream:
 
     def _update_elapsed(self, elapsed_ms: int) -> None:
         """Update elapsed time with session offset compensation."""
-        elapsed_advanced = self._last_elapsed_ms is None or elapsed_ms > self._last_elapsed_ms
-        if elapsed_advanced:
+        elapsed_changed = self._last_elapsed_ms != elapsed_ms
+        if elapsed_changed:
             self._last_elapsed_ms = elapsed_ms
             self._last_elapsed_advanced_at = time.monotonic()
         elapsed_time = elapsed_ms / 1000
@@ -511,7 +514,7 @@ class AirPlayStream:
         self.player.set_state_from_stream(
             state=PlaybackState.PLAYING, elapsed_time=elapsed_time, stream=self
         )
-        if elapsed_advanced:
+        if elapsed_changed:
             self._capture_confirmed_queue_position()
 
     async def _status_watchdog(self) -> None:

@@ -220,6 +220,11 @@ def test_native_realtime_stall_detection() -> None:
     with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=129):
         assert not stream._playback_status_stalled()
 
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=130):
+        stream._update_elapsed(500)
+    with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=144):
+        assert not stream._playback_status_stalled()
+
     stream._parse_route_status("[STATUS] route protocol=airplay2 flow=native timing=ptp buffered=1")
     with patch("music_assistant.providers.airplay.stream.time.monotonic", return_value=200):
         assert not stream._playback_status_stalled()
@@ -258,10 +263,15 @@ async def test_sessionless_stall_stops_sendspin_bridge() -> None:
     stream = AirPlayStream(player)
     stream._cli_proc = MagicMock(closed=False)
     stream._cli_proc.kill = AsyncMock()
+    stream._stdout_reader_task = MagicMock()
+    stream._stdout_reader_task.done.return_value = False
 
-    await stream.abort()
+    with patch.object(stream.commands_pipe, "remove", new_callable=AsyncMock) as remove_pipe:
+        await stream.abort()
 
     stream._cli_proc.kill.assert_awaited_once_with()
+    remove_pipe.assert_awaited_once_with()
+    stream._stdout_reader_task.cancel.assert_called_once_with()
     player.provider.bridge_manager.stop_streaming.assert_called_once_with(player.player_id)
     player.set_state_from_stream.assert_not_called()
 
