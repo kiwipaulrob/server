@@ -13,19 +13,12 @@ import asyncio
 import logging
 import os
 from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
-import shortuuid
 from aiohttp import ClientError
 from hass_client import HomeAssistantClient
 from hass_client.exceptions import BaseHassClientError
-from hass_client.utils import (
-    base_url,
-    get_auth_url,
-    get_long_lived_token,
-    get_token,
-    get_websocket_url,
-)
+from hass_client.utils import get_websocket_url
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
 from music_assistant_models.enums import (
     ConfigEntryType,
@@ -35,7 +28,6 @@ from music_assistant_models.enums import (
     StreamType,
 )
 from music_assistant_models.errors import (
-    LoginFailed,
     MusicAssistantError,
     SetupFailedError,
     UnsupportedFeaturedException,
@@ -44,9 +36,9 @@ from music_assistant_models.media_items.audio_format import AudioFormat
 from music_assistant_models.player_control import PlayerControl
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import MASS_LOGO_ONLINE, VERBOSE_LOG_LEVEL
-from music_assistant.helpers.auth import AuthenticationHelper
+from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.helpers.json import SerializableType
+from music_assistant.helpers.tags import async_parse_tags
 from music_assistant.helpers.util import try_parse_int
 from music_assistant.models.plugin import PluginProvider
 
@@ -66,7 +58,6 @@ if TYPE_CHECKING:
 DOMAIN = "hass"
 CONF_URL = "url"
 CONF_AUTH_TOKEN = "token"
-CONF_ACTION_AUTH = "auth"
 CONF_VERIFY_SSL = "verify_ssl"
 CONF_POWER_CONTROLS = "power_controls"
 CONF_MUTE_CONTROLS = "mute_controls"
@@ -83,6 +74,15 @@ CONTROL_DOMAINS = ("media_player", "switch", "input_boolean", "number", "input_n
 FEATURE_DOMAINS = ("tts", "ai_task")
 
 
+class DeviceMediaPlayerInfo(TypedDict):
+    """Home Assistant correlation info for a device that is natively connected elsewhere."""
+
+    # user-facing device name in HA (name_by_user or name)
+    name: str | None
+    # first enabled media_player entity of the device that supports announcements
+    announce_entity_id: str | None
+
+
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
@@ -93,44 +93,21 @@ async def setup(
 async def get_config_entries(
     mass: MusicAssistant,
     instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
+    action: str | None = None,  # noqa: ARG001
+    values: dict[str, ConfigValueType] | None = None,  # noqa: ARG001
 ) -> tuple[ConfigEntry, ...]:
     """
     Return Config entries to setup this provider.
 
-    instance_id: id of an existing provider instance (None if new instance setup).
-    action: [optional] action key called from config entries UI.
-    values: the (intermediate) raw values for config entries sent with the action.
-    """
-    # config flow auth action/step (authenticate button clicked)
-    if action == CONF_ACTION_AUTH and values:
-        hass_url = str(values[CONF_URL]).strip()
-        async with AuthenticationHelper(mass, str(values["session_id"])) as auth_helper:
-            client_id = base_url(auth_helper.callback_url)
-            auth_url = get_auth_url(
-                hass_url,
-                auth_helper.callback_url,
-                client_id=client_id,
-                state=values["session_id"],
-            )
-            result = await auth_helper.authenticate(auth_url)
-        if result["state"] != values["session_id"]:
-            msg = "session id mismatch"
-            raise LoginFailed(msg)
-        # get access token after auth was a success
-        token_details = await get_token(hass_url, result["code"], client_id=client_id)
-        # register for a long lived token
-        long_lived_token = await get_long_lived_token(
-            hass_url,
-            token_details["access_token"],
-            client_name=f"Music Assistant {shortuuid.random(6)}",
-            client_icon=MASS_LOGO_ONLINE,
-            lifespan=365 * 2,
-        )
-        # set the retrieved token on the values object to pass along
-        values[CONF_AUTH_TOKEN] = long_lived_token
+    The connection URL and authentication token are collected by the setup flow (see
+    setup_flow.py) unless running as a Home Assistant add-on, where they are fixed; only
+    the player-control and feature options are configurable here.
 
+    :param mass: The MusicAssistant instance.
+    :param instance_id: id of an existing provider instance (None if new instance setup).
+    :param action: [optional] action key called from config entries UI.
+    :param values: the (intermediate) raw values for config entries sent with the action.
+    """
     base_entries: tuple[ConfigEntry, ...]
     if mass.running_as_hass_addon:
         # on supervisor, we use the internal url
@@ -164,36 +141,8 @@ async def get_config_entries(
             ),
         )
     else:
-        # manual configuration
-        base_entries = (
-            ConfigEntry(
-                key=CONF_URL,
-                type=ConfigEntryType.STRING,
-                required=True,
-                value=cast("str", values.get(CONF_URL)) if values else None,
-            ),
-            ConfigEntry(
-                key=CONF_ACTION_AUTH,
-                type=ConfigEntryType.ACTION,
-                action=CONF_ACTION_AUTH,
-                depends_on=CONF_URL,
-                required=False,
-            ),
-            ConfigEntry(
-                key=CONF_AUTH_TOKEN,
-                type=ConfigEntryType.SECURE_STRING,
-                depends_on=CONF_URL,
-                value=cast("str", values.get(CONF_AUTH_TOKEN)) if values else None,
-                advanced=True,
-            ),
-            ConfigEntry(
-                key=CONF_VERIFY_SSL,
-                type=ConfigEntryType.BOOLEAN,
-                required=False,
-                advanced=True,
-                default_value=True,
-            ),
-        )
+        # url/token/verify_ssl are collected by the setup flow instead (see setup_flow.py)
+        base_entries = ()
 
     # append player controls entries (if we have an active instance)
     if instance_id and (hass_prov := mass.get_provider(instance_id)) and hass_prov.available:
@@ -352,10 +301,10 @@ class HomeAssistantProvider(PluginProvider):
             raise SetupFailedError(msg)
         self._startup_complete = False
         self._player_controls = {}
-        url = get_websocket_url(self.config.get_value(CONF_URL))
-        token = self.config.get_value(CONF_AUTH_TOKEN)
+        url = get_websocket_url(cast("str", self.get_setup_value(CONF_URL)))
+        token = self.get_setup_value(CONF_AUTH_TOKEN)
         logging.getLogger("hass_client").setLevel(self.logger.level + 10)
-        ssl = bool(self.config.get_value(CONF_VERIFY_SSL))
+        ssl = bool(self.get_setup_value(CONF_VERIFY_SSL, True))
         http_session = self.mass.http_session if ssl else self.mass.http_session_no_ssl
         self.hass = HomeAssistantClient(url, token, http_session)
         try:
@@ -404,27 +353,84 @@ class HomeAssistantProvider(PluginProvider):
             "player_controls": len(self._player_controls) if self._player_controls else 0,
         }
 
-    async def get_device_by_connection(
+    async def get_media_player_device_infos(
         self,
-        connection_value: str,
-        connection_type: str = "mac",
-    ) -> Device | None:
+        mac_addresses: Collection[str],
+        platform: str,
+    ) -> dict[str, DeviceMediaPlayerInfo]:
         """
-        Get device details from Home Assistant by connection type and value.
+        Correlate devices (by MAC address) to their HA name and media_player entity.
 
-        :param connection_value: The connection value (e.g. MAC address).
-        :param connection_type: The connection type (default: 'mac').
+        Used for devices that are natively connected to Music Assistant but also
+        present in Home Assistant, to pick up their HA device name and their
+        (announcement-capable) media_player entity.
+
+        :param mac_addresses: Device MAC addresses to look up (case-insensitive).
+        :param platform: The HA integration domain the media_player entities must belong to.
+        :return: Correlation info keyed by lowercased MAC address; devices unknown
+            to Home Assistant are absent from the result.
         """
-        devices = await self.hass.get_device_registry()
-        for device in devices:
-            for connection in device.get("connections", []):
-                if (
-                    len(connection) == 2
-                    and connection[0] == connection_type
-                    and connection[1].lower() == connection_value.lower()
-                ):
-                    return device
-        return None
+        wanted_macs = {mac.lower() for mac in mac_addresses}
+        if not wanted_macs:
+            return {}
+        device_registry = await self.hass.get_device_registry()
+        device_by_mac: dict[str, Device] = {
+            connection[1].lower(): device
+            for device in device_registry
+            for connection in device.get("connections", [])
+            if len(connection) == 2
+            and connection[0] == "mac"
+            and connection[1].lower() in wanted_macs
+        }
+        if not device_by_mac:
+            return {}
+        media_players_by_device: dict[str, list[str]] = {}
+        for entry in await self.hass.get_entity_registry():
+            if (
+                entry["platform"] == platform
+                and entry["entity_id"].startswith("media_player.")
+                and entry.get("disabled_by") is None
+            ):
+                media_players_by_device.setdefault(entry["device_id"], []).append(
+                    entry["entity_id"]
+                )
+        candidates_by_mac = {
+            mac: media_players_by_device.get(device["id"], [])
+            for mac, device in device_by_mac.items()
+        }
+        states = {
+            state["entity_id"]: state
+            for state in await self.get_states(
+                entity_ids=[
+                    entity_id
+                    for entity_ids in candidates_by_mac.values()
+                    for entity_id in entity_ids
+                ]
+            )
+        }
+
+        def _supports_announce(entity_id: str) -> bool:
+            if (state := states.get(entity_id)) is None:
+                return False
+            supported_features = MediaPlayerEntityFeature(
+                state["attributes"].get("supported_features") or 0
+            )
+            return MediaPlayerEntityFeature.MEDIA_ANNOUNCE in supported_features
+
+        return {
+            mac: DeviceMediaPlayerInfo(
+                name=device["name_by_user"] or device["name"],
+                announce_entity_id=next(
+                    (
+                        entity_id
+                        for entity_id in candidates_by_mac[mac]
+                        if _supports_announce(entity_id)
+                    ),
+                    None,
+                ),
+            )
+            for mac, device in device_by_mac.items()
+        }
 
     async def get_user_details(self, ha_user_id: str) -> tuple[str | None, str | None, str | None]:
         """
@@ -580,6 +586,32 @@ class HomeAssistantProvider(PluginProvider):
             msg = f"AI Task returned no data in response: {result}"
             raise MusicAssistantError(msg)
         return str(data)
+
+    async def play_announcement_on_entity(self, entity_id: str, announcement_url: str) -> None:
+        """
+        Play an announcement on a Home Assistant media_player entity.
+
+        Uses Home Assistant's announce feature, so the entity's integration ducks
+        or pauses any running playback and resumes it afterwards. Returns once the
+        announcement has finished playing (approximated by its duration).
+
+        :param entity_id: The media_player entity to play the announcement on.
+        :param announcement_url: URL of the announcement audio to play.
+        """
+        await self.hass.call_service(
+            domain="media_player",
+            service="play_media",
+            service_data={
+                "media_content_id": announcement_url,
+                "media_content_type": "music",
+                "announce": True,
+            },
+            target={"entity_id": entity_id},
+        )
+        # Wait until the announcement is finished playing so callers can play
+        # announcements in a sequence; HA gives no completion signal for announcements.
+        media_info = await async_parse_tags(announcement_url, require_duration=True)
+        await asyncio.sleep(media_info.duration or 5)
 
     async def get_tts_message(self, message: str, language: str | None = None) -> StreamDetails:
         """Handle text-to-speech via Home Assistant's REST API."""
@@ -765,11 +797,11 @@ class HomeAssistantProvider(PluginProvider):
 
     def _get_ha_http(self) -> tuple[str, dict[str, str], ClientSession]:
         """Return HA base URL (without trailing /api), auth headers, and the HTTP session."""
-        ha_url = cast("str", self.config.get_value(CONF_URL)).rstrip("/")
+        ha_url = cast("str", self.get_setup_value(CONF_URL)).rstrip("/")
         ha_url = ha_url.removesuffix("/api")
-        token = self.config.get_value(CONF_AUTH_TOKEN) or os.environ.get("HASSIO_TOKEN")
+        token = self.get_setup_value(CONF_AUTH_TOKEN) or os.environ.get("HASSIO_TOKEN")
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        ssl = bool(self.config.get_value(CONF_VERIFY_SSL))
+        ssl = bool(self.get_setup_value(CONF_VERIFY_SSL, True))
         http_session = self.mass.http_session if ssl else self.mass.http_session_no_ssl
         return ha_url, headers, http_session
 
