@@ -212,6 +212,16 @@ async def test_setup_applies_ram_scaled_pragmas(
         await db.close()
 
 
+async def test_setup_applies_busy_timeout(tmp_path: pathlib.Path) -> None:
+    """Test that setup() waits (rather than fails instantly) on locked database."""
+    db = DatabaseConnection(str(tmp_path / "busy.db"))
+    await db.setup()
+    try:
+        assert await _read_pragma_int(db, "busy_timeout") == 5000
+    finally:
+        await db.close()
+
+
 async def test_setup_clamps_pragma_values(tmp_path: pathlib.Path) -> None:
     """Test that setup() clamps explicit cache/mmap values to non-negative integers."""
     db = DatabaseConnection(str(tmp_path / "clamped.db"))

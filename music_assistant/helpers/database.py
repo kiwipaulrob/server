@@ -247,6 +247,10 @@ class DatabaseConnection:
         await self.execute("PRAGMA journal_mode=WAL;")
         await self.execute("PRAGMA journal_size_limit = 6144000;")
         await self.execute("PRAGMA synchronous=normal;")
+        # wait (rather than fail instantly) on momentary lock encounters: with
+        # exclusive locking and several concurrent writers, a brief wait absorbs
+        # transient contention that would otherwise surface as immediate errors.
+        await self.execute("PRAGMA busy_timeout = 5000;")
         await self.execute("PRAGMA temp_store=memory;")
         await self.execute(f"PRAGMA mmap_size = {mmap_size_bytes};")
         await self.execute(f"PRAGMA cache_size = -{cache_size_kib};")
