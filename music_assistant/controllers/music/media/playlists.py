@@ -1791,6 +1791,14 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 )
 
         if not ids_to_add:
+            self.logger.warning(
+                "Added 0 of %s requested item(s) to playlist %s "
+                "(%s track candidate(s) after unwrapping) - all were already present, "
+                "unsupported or unavailable; see preceding log lines for per-item reasons.",
+                total_requested,
+                playlist.name,
+                total_candidates,
+            )
             update_current_task_progress(100, "No new playlist items to add")
             return
 
@@ -1798,7 +1806,9 @@ class PlaylistController(MediaControllerBase[Playlist]):
         update_current_task_progress(90, f"Adding {len(ids_to_add)} item(s) to playlist")
         await playlist_prov.add_playlist_tracks(playlist_prov_item_id, ids_to_add)
         await self._request_metadata_refresh(playlist)
-        update_current_task_progress(100, f"Added {len(ids_to_add)} item(s) to playlist")
+        update_current_task_progress(
+            100, f"Added {len(ids_to_add)} of {total_requested} requested item(s) to playlist"
+        )
 
     async def _handle_remove_playlist_tracks(
         self, db_playlist_id: str | int, positions_to_remove: tuple[int, ...], user_id: str | None
