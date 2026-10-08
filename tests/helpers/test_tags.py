@@ -80,6 +80,17 @@ def test_parse_tags_reports_actionable_ffprobe_error(
     assert args[args.index("-loglevel") + 1] == "error"
 
 
+def test_parse_tags_reports_ffprobe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that a hung FFprobe is reported instead of blocking forever."""
+    check_output = MagicMock(side_effect=subprocess.TimeoutExpired(cmd=("ffprobe",), timeout=120))
+    monkeypatch.setattr(subprocess, "check_output", check_output)
+
+    with pytest.raises(InvalidDataError, match="Timed out after"):
+        tags.parse_tags("hung.mp3")
+
+    assert check_output.call_args.kwargs["timeout"] == tags._FFPROBE_TIMEOUT
+
+
 def test_parse_rejects_file_without_audio_channels() -> None:
     """A file for which ffprobe reports zero channels is corrupt and must be skipped."""
     raw = {

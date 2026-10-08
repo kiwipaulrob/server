@@ -56,6 +56,11 @@ _ALBUM_DATE_TAGS = ("date", "originaldate", "tdor", "originalyear", "tory")
 _NARRATOR_TAGS = ("narrator", "narratedby")
 _WRITER_TAGS = ("writers", "writer")
 
+# Maximum time in seconds to wait for ffprobe/ffmpeg to return file metadata.
+# Without a timeout, a single malformed file hangs its sync worker indefinitely,
+# wedging library sync progress with no failing task to inspect.
+_FFPROBE_TIMEOUT = 120
+
 
 def clean_tuple(values: Iterable[str]) -> tuple[str, ...]:
     """Return a tuple with all empty values removed."""
@@ -768,7 +773,12 @@ def parse_tags(
         input_file,
     )
     try:
-        res = subprocess.check_output(args, stderr=subprocess.PIPE, env=get_subprocess_env())  # noqa: S603
+        res = subprocess.check_output(  # noqa: S603
+            args,
+            stderr=subprocess.PIPE,
+            env=get_subprocess_env(),
+            timeout=_FFPROBE_TIMEOUT,
+        )
         data = json.loads(res)
         if error := data.get("error"):
             raise InvalidDataError(error["string"])
@@ -803,6 +813,12 @@ def parse_tags(
     except subprocess.CalledProcessError as err:
         error_msg = f"Unable to retrieve info for {input_file} ({_get_ffprobe_error(err)})"
         raise InvalidDataError(error_msg) from err
+    except subprocess.TimeoutExpired as err:
+        error_msg = (
+            f"Timed out after {_FFPROBE_TIMEOUT}s retrieving info for {input_file} "
+            "(ffprobe did not return)"
+        )
+        raise InvalidDataError(error_msg) from err
     except (KeyError, ValueError, JSONDecodeError, InvalidDataError) as err:
         try:
             msg = f"Unable to retrieve info for {input_file}: {err!s}"
@@ -831,7 +847,7 @@ def get_file_duration(input_file: str) -> float:
     )
     try:
         res = subprocess.check_output(  # noqa: S603
-            args, stderr=subprocess.STDOUT, env=get_subprocess_env()
+            args, stderr=subprocess.STDOUT, env=get_subprocess_env(), timeout=_FFPROBE_TIMEOUT
         ).decode()
         # extract duration from ffmpeg output
         duration_str = res.split("time=")[-1].split(" ")[0].strip()
